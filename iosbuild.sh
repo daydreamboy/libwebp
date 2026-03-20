@@ -207,30 +207,91 @@ for PLATFORM in ${PLATFORMS}; do
   export PATH="${OLDPATH}"
 done
 
-# ============================================================
-# 合并多架构库，组装 Framework
-# ============================================================
+# 创建通用的 Info.plist 模板
+INFO_PLIST='<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.webp.framework</string>
+    <key>CFBundleName</key>
+    <string>WebP</string>
+    <key>CFBundlePackageType</key>
+    <string>FMWK</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0.0</string>
+    <key>CFBundleVersion</key>
+    <string>1.0.0</string>
+    <key>NSPrincipalClass</key>
+    <string></string>
+</dict>
+</plist>'
+
+# 创建 umbrella header 文件 WebP.h
+UMBRELLA_HEADER="#ifndef __WEBP_H__
+#define __WEBP_H__
+
+#include \"decode.h\"
+#include \"encode.h\"
+#include \"types.h\"
+#include \"demux.h\"
+#include \"mux.h\"
+#include \"mux_types.h\"
+#include \"format_constants.h\"
+
+#endif // __WEBP_H__"
+
+# WebP.framework
+echo "$INFO_PLIST" > "${TARGETDIR}/Info.plist"
+mkdir -p "${TARGETDIR}/Headers"
+echo "$UMBRELLA_HEADER" > "${TARGETDIR}/Headers/WebP.h"
+cp -a "${SRCDIR}/src/webp/"{decode,encode,types,demux,mux,mux_types,format_constants}.h "${TARGETDIR}/Headers/"
+mkdir -p "${TARGETDIR}/Modules"
+cat << EOF > "${TARGETDIR}/Modules/module.modulemap"
+framework module WebP {
+    umbrella header "WebP.h"
+
+    export *
+}
+EOF
+
+# WebPDecoder.framework
+echo "$INFO_PLIST" > "${DECTARGETDIR}/Info.plist"
+mkdir -p "${DECTARGETDIR}/Headers"
+cp -a "${SRCDIR}/src/webp/"{decode,types}.h "${DECTARGETDIR}/Headers/"
+
+# WebPMux.framework
+echo "$INFO_PLIST" > "${MUXTARGETDIR}/Info.plist"
+mkdir -p "${MUXTARGETDIR}/Headers"
+cp -a "${SRCDIR}/src/webp/"{types,mux,mux_types}.h "${MUXTARGETDIR}/Headers/"
+
+# WebPDemux.framework
+echo "$INFO_PLIST" > "${DEMUXTARGETDIR}/Info.plist"
+mkdir -p "${DEMUXTARGETDIR}/Headers"
+cp -a "${SRCDIR}/src/webp/"{decode,types,mux_types,demux}.h "${DEMUXTARGETDIR}/Headers/"
+
+# SharpYuv.framework
+echo "$INFO_PLIST" > "${SHARPYUVTARGETDIR}/Info.plist"
+mkdir -p "${SHARPYUVTARGETDIR}/Headers"
+cp -a "${SRCDIR}/sharpyuv/"{sharpyuv,sharpyuv_csp}.h "${SHARPYUVTARGETDIR}/Headers/"
+
+# 合并多架构库
 echo ""
 echo "LIBLIST = ${LIBLIST}"
-cp -a "${SRCDIR}/src/webp/"{decode,encode,types}.h "${TARGETDIR}/Headers/"
 ${LIPO} -create ${LIBLIST} -output "${TARGETDIR}/WebP"
 
 echo "DECLIBLIST = ${DECLIBLIST}"
-cp -a "${SRCDIR}/src/webp/"{decode,types}.h "${DECTARGETDIR}/Headers/"
 ${LIPO} -create ${DECLIBLIST} -output "${DECTARGETDIR}/WebPDecoder"
 
 echo "MUXLIBLIST = ${MUXLIBLIST}"
-cp -a "${SRCDIR}/src/webp/"{types,mux,mux_types}.h "${MUXTARGETDIR}/Headers/"
 ${LIPO} -create ${MUXLIBLIST} -output "${MUXTARGETDIR}/WebPMux"
 
 echo "DEMUXLIBLIST = ${DEMUXLIBLIST}"
-cp -a "${SRCDIR}/src/webp/"{decode,types,mux_types,demux}.h \
-    "${DEMUXTARGETDIR}/Headers/"
 ${LIPO} -create ${DEMUXLIBLIST} -output "${DEMUXTARGETDIR}/WebPDemux"
 
 echo "SHARPYUVLIBLIST = ${SHARPYUVLIBLIST}"
-cp -a "${SRCDIR}/sharpyuv/"{sharpyuv,sharpyuv_csp}.h \
-    "${SHARPYUVTARGETDIR}/Headers/"
 ${LIPO} -create ${SHARPYUVLIBLIST} -output "${SHARPYUVTARGETDIR}/SharpYuv"
 
 # ============================================================

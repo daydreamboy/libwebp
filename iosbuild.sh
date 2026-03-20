@@ -13,15 +13,23 @@
 
 set -e
 
+# ============================================================
+# 关键修复：重置 TMPDIR，解决 clang 无法创建临时文件的问题
+# 原因：macOS 的 TMPDIR 通常是 /var/folders/... 这样的路径
+#       某些情况下该目录权限异常，导致 clang 报 Permission denied
+# ============================================================
+export TMPDIR=$(mktemp -d)
+echo "TMPDIR reset to: ${TMPDIR}"
+
 # Set this variable based on the desired minimum deployment target.
 readonly IOS_MIN_VERSION=6.0
 
 # Extract the latest SDK version from the final field of the form: iphoneosX.Y
 readonly SDK=$(xcodebuild -showsdks \
-  | grep iphoneos | sort | tail -n 1 | awk '{print substr($NF, 9)}'
+  | grep --color=never iphoneos | sort | tail -n 1 | awk '{print substr($NF, 9)}'
 )
 # Extract Xcode version.
-readonly XCODE=$(xcodebuild -version | grep Xcode | cut -d " " -f2)
+readonly XCODE=$(xcodebuild -version | grep --color=never Xcode | cut -d " " -f2)
 if [[ -z "${XCODE}" ]]; then
   echo "Xcode not available"
   exit 1
@@ -29,12 +37,12 @@ fi
 
 readonly OLDPATH=${PATH}
 
-# Add iPhoneOS-V6 to the list of platforms below if you need armv6 support.
-# Note that iPhoneOS-V6 support is not available with the iOS6 SDK.
 PLATFORMS="iPhoneSimulator64"
 PLATFORMS+=" iPhoneOS-arm64"
 readonly PLATFORMS
-readonly SRCDIR=$(dirname $0)
+
+# 使用绝对路径，避免切换目录后路径失效
+readonly SRCDIR=$(cd "$(dirname $0)" && pwd)
 readonly TOPDIR=$(pwd)
 readonly BUILDDIR="${TOPDIR}/iosbuild"
 readonly TARGETDIR="${TOPDIR}/WebP.framework"
@@ -45,10 +53,12 @@ readonly SHARPYUVTARGETDIR="${TOPDIR}/SharpYuv.framework"
 readonly DEVELOPER=$(xcode-select --print-path)
 readonly PLATFORMSROOT="${DEVELOPER}/Platforms"
 readonly LIPO=$(xcrun -sdk iphoneos${SDK} -find lipo)
+
 LIBLIST=''
 DECLIBLIST=''
 MUXLIBLIST=''
 DEMUXLIBLIST=''
+SHARPYUVLIBLIST=''
 
 if [[ -z "${SDK}" ]]; then
   echo "iOS SDK not available"
@@ -78,14 +88,15 @@ WARNING: The build will continue in 5 seconds...
 EOF
   sleep 5
 fi
-rm -rf ${BUILDDIR} ${TARGETDIR} ${DECTARGETDIR} \
-    ${MUXTARGETDIR} ${DEMUXTARGETDIR} ${SHARPYUVTARGETDIR}
-mkdir -p ${BUILDDIR} ${TARGETDIR}/Headers/ ${DECTARGETDIR}/Headers/ \
-    ${MUXTARGETDIR}/Headers/ ${DEMUXTARGETDIR}/Headers/ \
-    ${SHARPYUVTARGETDIR}/Headers/
 
-if [[ ! -e ${SRCDIR}/configure ]]; then
-  if ! (cd ${SRCDIR} && sh autogen.sh); then
+rm -rf "${BUILDDIR}" "${TARGETDIR}" "${DECTARGETDIR}" \
+    "${MUXTARGETDIR}" "${DEMUXTARGETDIR}" "${SHARPYUVTARGETDIR}"
+mkdir -p "${BUILDDIR}" "${TARGETDIR}/Headers/" "${DECTARGETDIR}/Headers/" \
+    "${MUXTARGETDIR}/Headers/" "${DEMUXTARGETDIR}/Headers/" \
+    "${SHARPYUVTARGETDIR}/Headers/"
+
+if [[ ! -e "${SRCDIR}/configure" ]]; then
+  if ! (cd "${SRCDIR}" && sh autogen.sh); then
     cat << EOF
 Error creating configure script!
 This script requires the autoconf/automake and libtool to build. MacPorts can
@@ -118,26 +129,68 @@ for PLATFORM in ${PLATFORMS}; do
     ARCH="i386"
   fi
 
+  # 安装目录
   ROOTDIR="${BUILDDIR}/${PLATFORM}-${SDK}-${ARCH}"
+  # 独立构建目录（configure 在此目录运行，避免污染源码目录）
+  BUILDSUBDIR="${BUILDDIR}/build-${PLATFORM}-${SDK}-${ARCH}"
   mkdir -p "${ROOTDIR}"
+  mkdir -p "${BUILDSUBDIR}"
 
   DEVROOT="${DEVELOPER}/Toolchains/XcodeDefault.xctoolchain"
   SDKROOT="${PLATFORMSROOT}/"
-  SDKROOT+="${PLATFORM}.platform/Developer/SDKs/${PLATFORM}${SDK}.sdk/"
+  SDKROOT+="${PLATFORM}.platform/Developer/SDKs/${PLATFORM}${SDK}.sdk"
+
+  # 验证 SDK 路径是否存在
+  if [[ ! -d "${SDKROOT}" ]]; then
+    echo "ERROR: SDK not found at ${SDKROOT}"
+    exit 1
+  fi
+
+  # 使用 xcrun 获取工具链中各工具的完整路径
+  CC=$(xcrun --sdk "${SDKROOT}" --find clang)
+  AR=$(xcrun --sdk "${SDKROOT}" --find ar)
+  RANLIB=$(xcrun --sdk "${SDKROOT}" --find ranlib)
+  STRIP=$(xcrun --sdk "${SDKROOT}" --find strip)
+  NM=$(xcrun --sdk "${SDKROOT}" --find nm)
+
   CFLAGS="-arch ${ARCH2:-${ARCH}} -pipe -isysroot ${SDKROOT} -O3 -DNDEBUG"
   CFLAGS+=" -miphoneos-version-min=${IOS_MIN_VERSION} ${EXTRA_CFLAGS}"
 
-  set -x
+  echo ""
+  echo "========================================"
+  echo "Platform  : ${PLATFORM}"
+  echo "Arch      : ${ARCH2:-${ARCH}}"
+  echo "CC        : ${CC}"
+  echo "AR        : ${AR}"
+  echo "SDKROOT   : ${SDKROOT}"
+  echo "BUILDDIR  : ${BUILDSUBDIR}"
+  echo "TMPDIR    : ${TMPDIR}"
+  echo "========================================"
+
   export PATH="${DEVROOT}/usr/bin:${OLDPATH}"
-  ${SRCDIR}/configure --host=${ARCH}-apple-darwin --prefix=${ROOTDIR} \
-    --build=$(${SRCDIR}/config.guess) \
-    --disable-shared --enable-static \
-    --enable-libwebpdecoder --enable-swap-16bit-csp \
+
+  # 切换到独立构建目录后再运行 configure
+  set -x
+  cd "${BUILDSUBDIR}"
+
+  "${SRCDIR}/configure" \
+    --host="${ARCH}-apple-darwin" \
+    --prefix="${ROOTDIR}" \
+    --build=$("${SRCDIR}/config.guess") \
+    --disable-shared \
+    --enable-static \
+    --enable-libwebpdecoder \
+    --enable-swap-16bit-csp \
     --enable-libwebpmux \
+    CC="${CC}" \
+    AR="${AR}" \
+    RANLIB="${RANLIB}" \
+    STRIP="${STRIP}" \
+    NM="${NM}" \
     CFLAGS="${CFLAGS}"
   set +x
 
-  # Build only the libraries, skip the examples.
+  # 在构建目录中编译并安装
   make V=0 -C sharpyuv install
   make V=0 -C src install
 
@@ -149,30 +202,54 @@ for PLATFORM in ${PLATFORMS}; do
 
   make clean
 
-  export PATH=${OLDPATH}
+  # 返回顶层目录，准备下一次循环
+  cd "${TOPDIR}"
+  export PATH="${OLDPATH}"
 done
 
+# ============================================================
+# 合并多架构库，组装 Framework
+# ============================================================
+echo ""
 echo "LIBLIST = ${LIBLIST}"
-cp -a ${SRCDIR}/src/webp/{decode,encode,types}.h ${TARGETDIR}/Headers/
-${LIPO} -create ${LIBLIST} -output ${TARGETDIR}/WebP
+cp -a "${SRCDIR}/src/webp/"{decode,encode,types}.h "${TARGETDIR}/Headers/"
+${LIPO} -create ${LIBLIST} -output "${TARGETDIR}/WebP"
 
 echo "DECLIBLIST = ${DECLIBLIST}"
-cp -a ${SRCDIR}/src/webp/{decode,types}.h ${DECTARGETDIR}/Headers/
-${LIPO} -create ${DECLIBLIST} -output ${DECTARGETDIR}/WebPDecoder
+cp -a "${SRCDIR}/src/webp/"{decode,types}.h "${DECTARGETDIR}/Headers/"
+${LIPO} -create ${DECLIBLIST} -output "${DECTARGETDIR}/WebPDecoder"
 
 echo "MUXLIBLIST = ${MUXLIBLIST}"
-cp -a ${SRCDIR}/src/webp/{types,mux,mux_types}.h \
-    ${MUXTARGETDIR}/Headers/
-${LIPO} -create ${MUXLIBLIST} -output ${MUXTARGETDIR}/WebPMux
+cp -a "${SRCDIR}/src/webp/"{types,mux,mux_types}.h "${MUXTARGETDIR}/Headers/"
+${LIPO} -create ${MUXLIBLIST} -output "${MUXTARGETDIR}/WebPMux"
 
 echo "DEMUXLIBLIST = ${DEMUXLIBLIST}"
-cp -a ${SRCDIR}/src/webp/{decode,types,mux_types,demux}.h \
-    ${DEMUXTARGETDIR}/Headers/
-${LIPO} -create ${DEMUXLIBLIST} -output ${DEMUXTARGETDIR}/WebPDemux
+cp -a "${SRCDIR}/src/webp/"{decode,types,mux_types,demux}.h \
+    "${DEMUXTARGETDIR}/Headers/"
+${LIPO} -create ${DEMUXLIBLIST} -output "${DEMUXTARGETDIR}/WebPDemux"
 
 echo "SHARPYUVLIBLIST = ${SHARPYUVLIBLIST}"
-cp -a ${SRCDIR}/sharpyuv/{sharpyuv,sharpyuv_csp}.h \
-    ${SHARPYUVTARGETDIR}/Headers/
-${LIPO} -create ${SHARPYUVLIBLIST} -output ${SHARPYUVTARGETDIR}/SharpYuv
+cp -a "${SRCDIR}/sharpyuv/"{sharpyuv,sharpyuv_csp}.h \
+    "${SHARPYUVTARGETDIR}/Headers/"
+${LIPO} -create ${SHARPYUVLIBLIST} -output "${SHARPYUVTARGETDIR}/SharpYuv"
 
-echo  "SUCCESS"
+# ============================================================
+# 验证生成结果
+# ============================================================
+echo ""
+echo "Verifying Frameworks architecture..."
+for FW in \
+    "${TARGETDIR}/WebP" \
+    "${DECTARGETDIR}/WebPDecoder" \
+    "${MUXTARGETDIR}/WebPMux" \
+    "${DEMUXTARGETDIR}/WebPDemux" \
+    "${SHARPYUVTARGETDIR}/SharpYuv"; do
+  echo -n "  $(basename ${FW}): "
+  ${LIPO} -info "${FW}"
+done
+
+# 清理临时目录
+rm -rf "${TMPDIR}"
+
+echo ""
+echo "SUCCESS"

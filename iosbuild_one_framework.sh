@@ -1,23 +1,19 @@
 #!/usr/bin/env bash
 #
-# This script generates 'WebP.framework' and 'WebPDecoder.framework',
-# 'WebPDemux.framework' and 'WebPMux.framework'.
-# An iOS app can decode WebP images by including 'WebPDecoder.framework' and
-# both encode and decode WebP images by including 'WebP.framework'.
+# This script generates a single 'WebP.framework' containing all WebP libraries:
+# - libwebp (encode/decode)
+# - libwebpdecoder (decode only)
+# - libwebpmux (mux/demux)
+# - libwebpdemux
+# - libsharpyuv
 #
-# Run ./iosbuild.sh to generate the frameworks under the current directory
-# (the previous build will be erased if it exists).
+# An iOS app can include this framework to both encode and decode WebP images.
 #
-# This script is inspired by the build script written by Carson McDonald.
-# (https://www.ioncannon.net/programming/1483/using-webp-to-reduce-native-ios-app-size/).
+# Run ./iosbuild.sh to generate the framework under the current directory.
 
 set -e
 
-# ============================================================
 # 关键修复：重置 TMPDIR，解决 clang 无法创建临时文件的问题
-# 原因：macOS 的 TMPDIR 通常是 /var/folders/... 这样的路径
-#       某些情况下该目录权限异常，导致 clang 报 Permission denied
-# ============================================================
 export TMPDIR=$(mktemp -d)
 echo "TMPDIR reset to: ${TMPDIR}"
 
@@ -28,6 +24,7 @@ readonly IOS_MIN_VERSION=6.0
 readonly SDK=$(xcodebuild -showsdks \
   | grep --color=never iphoneos | sort | tail -n 1 | awk '{print substr($NF, 9)}'
 )
+
 # Extract Xcode version.
 readonly XCODE=$(xcodebuild -version | grep --color=never Xcode | cut -d " " -f2)
 if [[ -z "${XCODE}" ]]; then
@@ -37,8 +34,7 @@ fi
 
 readonly OLDPATH=${PATH}
 
-PLATFORMS="iPhoneSimulator64"
-PLATFORMS+=" iPhoneOS-arm64"
+PLATFORMS="iPhoneSimulator64 iPhoneOS-arm64"
 readonly PLATFORMS
 
 # 使用绝对路径，避免切换目录后路径失效
@@ -46,19 +42,11 @@ readonly SRCDIR=$(cd "$(dirname $0)" && pwd)
 readonly TOPDIR=$(pwd)
 readonly BUILDDIR="${TOPDIR}/iosbuild"
 readonly TARGETDIR="${TOPDIR}/WebP.framework"
-readonly DECTARGETDIR="${TOPDIR}/WebPDecoder.framework"
-readonly MUXTARGETDIR="${TOPDIR}/WebPMux.framework"
-readonly DEMUXTARGETDIR="${TOPDIR}/WebPDemux.framework"
-readonly SHARPYUVTARGETDIR="${TOPDIR}/SharpYuv.framework"
 readonly DEVELOPER=$(xcode-select --print-path)
 readonly PLATFORMSROOT="${DEVELOPER}/Platforms"
 readonly LIPO=$(xcrun -sdk iphoneos${SDK} -find lipo)
 
-LIBLIST=''
-DECLIBLIST=''
-MUXLIBLIST=''
-DEMUXLIBLIST=''
-SHARPYUVLIBLIST=''
+LIBOBJLIST=''
 
 if [[ -z "${SDK}" ]]; then
   echo "iOS SDK not available"
@@ -73,27 +61,18 @@ fi
 echo "Xcode Version: ${XCODE}"
 echo "iOS SDK Version: ${SDK}"
 
-if [[ -e "${BUILDDIR}" || -e "${TARGETDIR}" || -e "${DECTARGETDIR}" \
-      || -e "${MUXTARGETDIR}" || -e "${DEMUXTARGETDIR}" \
-      || -e "${SHARPYUVTARGETDIR}" ]]; then
+if [[ -e "${BUILDDIR}" || -e "${TARGETDIR}" ]]; then
   cat << EOF
 WARNING: The following directories will be deleted:
 WARNING:   ${BUILDDIR}
 WARNING:   ${TARGETDIR}
-WARNING:   ${DECTARGETDIR}
-WARNING:   ${MUXTARGETDIR}
-WARNING:   ${DEMUXTARGETDIR}
-WARNING:   ${SHARPYUVTARGETDIR}
 WARNING: The build will continue in 5 seconds...
 EOF
   sleep 5
 fi
 
-rm -rf "${BUILDDIR}" "${TARGETDIR}" "${DECTARGETDIR}" \
-    "${MUXTARGETDIR}" "${DEMUXTARGETDIR}" "${SHARPYUVTARGETDIR}"
-mkdir -p "${BUILDDIR}" "${TARGETDIR}/Headers/" "${DECTARGETDIR}/Headers/" \
-    "${MUXTARGETDIR}/Headers/" "${DEMUXTARGETDIR}/Headers/" \
-    "${SHARPYUVTARGETDIR}/Headers/"
+rm -rf "${BUILDDIR}" "${TARGETDIR}"
+mkdir -p "${BUILDDIR}" "${TARGETDIR}/Headers/" "${TARGETDIR}/Modules/"
 
 if [[ ! -e "${SRCDIR}/configure" ]]; then
   if ! (cd "${SRCDIR}" && sh autogen.sh); then
@@ -113,15 +92,6 @@ for PLATFORM in ${PLATFORMS}; do
     PLATFORM="iPhoneOS"
     ARCH="aarch64"
     ARCH2="arm64"
-  elif [[ "${PLATFORM}" == "iPhoneOS-V7s" ]]; then
-    PLATFORM="iPhoneOS"
-    ARCH="armv7s"
-  elif [[ "${PLATFORM}" == "iPhoneOS-V7" ]]; then
-    PLATFORM="iPhoneOS"
-    ARCH="armv7"
-  elif [[ "${PLATFORM}" == "iPhoneOS-V6" ]]; then
-    PLATFORM="iPhoneOS"
-    ARCH="armv6"
   elif [[ "${PLATFORM}" == "iPhoneSimulator64" ]]; then
     PLATFORM="iPhoneSimulator"
     ARCH="x86_64"
@@ -136,17 +106,14 @@ for PLATFORM in ${PLATFORMS}; do
   mkdir -p "${ROOTDIR}"
   mkdir -p "${BUILDSUBDIR}"
 
-  DEVROOT="${DEVELOPER}/Toolchains/XcodeDefault.xctoolchain"
-  SDKROOT="${PLATFORMSROOT}/"
-  SDKROOT+="${PLATFORM}.platform/Developer/SDKs/${PLATFORM}${SDK}.sdk"
+  SDKROOT="${PLATFORMSROOT}/${PLATFORM}.platform/Developer/SDKs/${PLATFORM}${SDK}.sdk"
 
-  # 验证 SDK 路径是否存在
   if [[ ! -d "${SDKROOT}" ]]; then
     echo "ERROR: SDK not found at ${SDKROOT}"
     exit 1
   fi
 
-  # 使用 xcrun 获取工具链中各工具的完整路径
+  # 获取工具链路径
   CC=$(xcrun --sdk "${SDKROOT}" --find clang)
   AR=$(xcrun --sdk "${SDKROOT}" --find ar)
   RANLIB=$(xcrun --sdk "${SDKROOT}" --find ranlib)
@@ -167,12 +134,11 @@ for PLATFORM in ${PLATFORMS}; do
   echo "TMPDIR    : ${TMPDIR}"
   echo "========================================"
 
-  export PATH="${DEVROOT}/usr/bin:${OLDPATH}"
+  export PATH="${DEVELOPER}/Toolchains/XcodeDefault.xctoolchain/usr/bin:${OLDPATH}"
 
-  # 切换到独立构建目录后再运行 configure
-  set -x
   cd "${BUILDSUBDIR}"
 
+  set -x
   "${SRCDIR}/configure" \
     --host="${ARCH}-apple-darwin" \
     --prefix="${ROOTDIR}" \
@@ -191,21 +157,31 @@ for PLATFORM in ${PLATFORMS}; do
     CFLAGS="${CFLAGS}"
   set +x
 
-  # 在构建目录中编译并安装
   make V=0 -C sharpyuv install
   make V=0 -C src install
 
-  LIBLIST+=" ${ROOTDIR}/lib/libwebp.a"
-  DECLIBLIST+=" ${ROOTDIR}/lib/libwebpdecoder.a"
-  MUXLIBLIST+=" ${ROOTDIR}/lib/libwebpmux.a"
-  DEMUXLIBLIST+=" ${ROOTDIR}/lib/libwebpdemux.a"
-  SHARPYUVLIBLIST+=" ${ROOTDIR}/lib/libsharpyuv.a"
+  # 提取所有的 .o 文件，并为每种架构保存
+  for lib in libwebp.a libwebpdecoder.a libwebpmux.a libwebpdemux.a libsharpyuv.a; do
+    obj_dir="${BUILDDIR}/objs/${PLATFORM}-${SDK}-${ARCH}"
+    mkdir -p "$obj_dir"
+    xcrun -sdk "${SDKROOT}" ar x "${ROOTDIR}/lib/${lib}"
+    find . -name "*.o" -exec mv {} "${obj_dir}/" \;
+  done
 
   make clean
 
-  # 返回顶层目录，准备下一次循环
   cd "${TOPDIR}"
   export PATH="${OLDPATH}"
+done
+
+# 收集所有目标文件
+OBJFILES=()
+for dir in "${BUILDDIR}/objs"/*; do
+  if [ -d "$dir" ]; then
+    for obj in "$dir"/*.o; do
+      OBJFILES+=("$obj")
+    done
+  fi
 done
 
 # 创建通用的 Info.plist 模板
@@ -241,14 +217,23 @@ UMBRELLA_HEADER="#ifndef __WEBP_H__
 #include \"mux.h\"
 #include \"mux_types.h\"
 #include \"format_constants.h\"
+#include \"sharpyuv.h\"
+#include \"sharpyuv_csp.h\"
 
 #endif // __WEBP_H__"
 
-# WebP.framework
+# 写入 Info.plist
 echo "$INFO_PLIST" > "${TARGETDIR}/Info.plist"
+
+# 写入 umbrella header
 mkdir -p "${TARGETDIR}/Headers"
 echo "$UMBRELLA_HEADER" > "${TARGETDIR}/Headers/WebP.h"
+
+# 复制所有需要的头文件
 cp -a "${SRCDIR}/src/webp/"{decode,encode,types,demux,mux,mux_types,format_constants}.h "${TARGETDIR}/Headers/"
+cp -a "${SRCDIR}/sharpyuv/"{sharpyuv,sharpyuv_csp}.h "${TARGETDIR}/Headers/"
+
+# 创建 Modules/module.modulemap
 mkdir -p "${TARGETDIR}/Modules"
 cat << EOF > "${TARGETDIR}/Modules/module.modulemap"
 framework module WebP {
@@ -258,57 +243,76 @@ framework module WebP {
 }
 EOF
 
-# WebPDecoder.framework
-echo "$INFO_PLIST" > "${DECTARGETDIR}/Info.plist"
-mkdir -p "${DECTARGETDIR}/Headers"
-cp -a "${SRCDIR}/src/webp/"{decode,types}.h "${DECTARGETDIR}/Headers/"
+# 将所有目标文件打包成一个静态库
+FINAL_A_FILE="${TARGETDIR}/WebP"
+TEMP_DIR=$(mktemp -d)
+cd "$TEMP_DIR"
 
-# WebPMux.framework
-echo "$INFO_PLIST" > "${MUXTARGETDIR}/Info.plist"
-mkdir -p "${MUXTARGETDIR}/Headers"
-cp -a "${SRCDIR}/src/webp/"{types,mux,mux_types}.h "${MUXTARGETDIR}/Headers/"
-
-# WebPDemux.framework
-echo "$INFO_PLIST" > "${DEMUXTARGETDIR}/Info.plist"
-mkdir -p "${DEMUXTARGETDIR}/Headers"
-cp -a "${SRCDIR}/src/webp/"{decode,types,mux_types,demux}.h "${DEMUXTARGETDIR}/Headers/"
-
-# SharpYuv.framework
-echo "$INFO_PLIST" > "${SHARPYUVTARGETDIR}/Info.plist"
-mkdir -p "${SHARPYUVTARGETDIR}/Headers"
-cp -a "${SRCDIR}/sharpyuv/"{sharpyuv,sharpyuv_csp}.h "${SHARPYUVTARGETDIR}/Headers/"
-
-# 合并多架构库
-echo ""
-echo "LIBLIST = ${LIBLIST}"
-${LIPO} -create ${LIBLIST} -output "${TARGETDIR}/WebP"
-
-echo "DECLIBLIST = ${DECLIBLIST}"
-${LIPO} -create ${DECLIBLIST} -output "${DECTARGETDIR}/WebPDecoder"
-
-echo "MUXLIBLIST = ${MUXLIBLIST}"
-${LIPO} -create ${MUXLIBLIST} -output "${MUXTARGETDIR}/WebPMux"
-
-echo "DEMUXLIBLIST = ${DEMUXLIBLIST}"
-${LIPO} -create ${DEMUXLIBLIST} -output "${DEMUXTARGETDIR}/WebPDemux"
-
-echo "SHARPYUVLIBLIST = ${SHARPYUVLIBLIST}"
-${LIPO} -create ${SHARPYUVLIBLIST} -output "${SHARPYUVTARGETDIR}/SharpYuv"
-
-# ============================================================
-# 验证生成结果
-# ============================================================
-echo ""
-echo "Verifying Frameworks architecture..."
-for FW in \
-    "${TARGETDIR}/WebP" \
-    "${DECTARGETDIR}/WebPDecoder" \
-    "${MUXTARGETDIR}/WebPMux" \
-    "${DEMUXTARGETDIR}/WebPDemux" \
-    "${SHARPYUVTARGETDIR}/SharpYuv"; do
-  echo -n "  $(basename ${FW}): "
-  ${LIPO} -info "${FW}"
+# 将所有目标文件复制到临时目录
+for obj in "${OBJFILES[@]}"; do
+  cp "$obj" .
 done
+
+# 模拟关联数组：格式为 "arch:obj1 obj2 obj3"
+archs=()
+
+for obj in *.o; do
+  arch=$(file "$obj" | grep -oE 'Mach-O ([^ ]+) object')
+  if [[ -n "$arch" ]]; then
+    # 提取架构名（如 "x86_64", "arm64"）
+    arch_name="${arch#Mach-O }"
+    arch_name="${arch_name% object}"
+
+    # 检查是否已经添加过该架构
+    found=false
+    for i in "${!archs[@]}"; do
+      if [[ "${archs[$i]}" == "$arch_name:"* ]]; then
+        # 已存在该架构，追加目标文件
+        archs[$i]="${archs[$i]} $obj"
+        found=true
+        break
+      fi
+    done
+
+    if ! $found; then
+      # 新架构，新建条目
+      archs+=("$arch_name:$obj")
+    fi
+  fi
+done
+
+# 创建 fat binary
+fat_binary="libWebP.a"
+touch "$fat_binary"
+
+# 先为每个架构创建 thin binary
+for entry in "${archs[@]}"; do
+  IFS=':' read -r arch obj_list <<< "$entry"
+
+  thin_lib="libWebP-$arch.a"
+  xcrun -sdk iphoneos${SDK} ar rcs "$thin_lib" $obj_list
+done
+
+# 将所有 thin binary 用 lipo 合并为一个 fat binary
+all_thin_libs=()
+for entry in "${archs[@]}"; do
+  IFS=':' read -r arch _ <<< "$entry"
+  all_thin_libs+=("libWebP-$arch.a")
+done
+
+xcrun -sdk iphoneos${SDK} lipo -create "${all_thin_libs[@]}" -output "$fat_binary"
+
+# 移动最终的 fat binary 到 Framework
+mv "$fat_binary" "${FINAL_A_FILE}"
+
+# 验证架构
+echo ""
+echo "Verifying Framework architecture..."
+xcrun -sdk iphoneos${SDK} lipo -info "${FINAL_A_FILE}"
+
+# 清理临时目录
+cd "${TOPDIR}"
+rm -rf "$TEMP_DIR" "${BUILDDIR}/objs"
 
 # 清理临时目录
 rm -rf "${TMPDIR}"
